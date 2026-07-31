@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>A-Frame 3D迷路マルチプレイ（完全デバッグ飛行＆コイン収集版）</title>
+    <!-- A-Frame -->
+    <script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
+    <!-- Socket.IO -->
+    <script src="/socket.io/socket.io.js"></script>
+</head>
+
+<body>
+    <script>
+        // --- 初期位置を保持するグローバル変数 ---
+        let spawnPosition = { x: 0, y: 1.6, z: 0 };
+
+        // --- 壁の衝突判定 兼 デバッグ飛行コンポーネント ---
+        AFRAME.registerComponent('simple-collider', {
+            init: function () {
+                this.raycaster = new THREE.Raycaster();
+                this.prevPosition = new THREE.Vector3();
+                this.prevPosition.copy(this.el.object3D.position);
+                this.radius = 0.5;
+                this.wallObjects = [];
+                this.isFlying = false;
+
+                this.keys = { w: false, a: false, s: false, d: false, space: false, ctrl: false };
+
+                const root2 = Math.SQRT1_2;
+                this.directions = [
+                    new THREE.Vector3(1, 0, 0), new THREE.Vector3(-1, 0, 0),
+                    new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0, -1),
+                    new THREE.Vector3(root2, 0, root2), new THREE.Vector3(-root2, 0, root2),
+                    new THREE.Vector3(root2, 0, -root2), new THREE.Vector3(-root2, 0, -root2)
+                ];
+
+                window.addEventListener('keydown', (e) => {
+                    if (e.shiftKey && e.code === 'KeyP') {
+                        this.isFlying = true;
+                        console.log('[デバッグ] 飛行モード有効 (Shift + P): Spaceで上昇、Ctrlで下降');
+                    } else if (e.shiftKey && e.code === 'KeyL') {
+                        this.isFlying = false;
+                        this.el.object3D.position.y = 1.6;
+                        console.log('[デバッグ] 飛行モード解除・着地 (Shift + L)');
+                    }
+
+                    if (e.code === 'KeyW' || e.code === 'ArrowUp') this.keys.w = true;
+                    if (e.code === 'KeyS' || e.code === 'ArrowDown') this.keys.s = true;
+                    if (e.code === 'KeyA' || e.code === 'ArrowLeft') this.keys.a = true;
+                    if (e.code === 'KeyD' || e.code === 'ArrowRight') this.keys.d = true;
+                    if (e.code === 'Space') this.keys.space = true;
+                    if (e.code === 'ControlLeft' || e.code === 'ControlRight') this.keys.ctrl = true;
+                });
+
+                window.addEventListener('keyup', (e) => {
+                    if (e.code === 'KeyW' || e.code === 'ArrowUp') this.keys.w = false;
+                    if (e.code === 'KeyS' || e.code === 'ArrowDown') this.keys.s = false;
+                    if (e.code === 'KeyA' || e.code === 'ArrowLeft') this.keys.a = false;
+                    if (e.code === 'KeyD' || e.code === 'ArrowRight') this.keys.d = false;
+                    if (e.code === 'Space') this.keys.space = false;
+                    if (e.code === 'ControlLeft' || e.code === 'ControlRight') this.keys.ctrl = false;
+                });
+            },
+            updateWalls: function () {
+                const wallElements = document.querySelectorAll('.wall');
+                this.wallObjects = Array.from(wallElements).map(w => w.object3D);
+            },
+            resetPrevPosition: function () {
+                // テレポート直後に位置を正常化するためのメソッド
+                this.prevPosition.copy(this.el.object3D.position);
+            },
+            tick: function (time, delta) {
+                const el = this.el;
+                const speed = 0.015 * delta;
+
+                if (this.isFlying) {
+                    const cameraEl = el.sceneEl.camera;
+                    if (cameraEl) {
+                        const rot = el.object3D.rotation;
+                        const forward = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), rot.y);
+                        const right = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), rot.y);
+
+                        if (this.keys.w) el.object3D.position.addScaledVector(forward, speed);
+                        if (this.keys.s) el.object3D.position.addScaledVector(forward, -speed);
+                        if (this.keys.a) el.object3D.position.addScaledVector(right, -speed);
+                        if (this.keys.d) el.object3D.position.addScaledVector(right, speed);
+                        if (this.keys.space) el.object3D.position.y += speed;
+                        if (this.keys.ctrl) el.object3D.position.y -= speed;
+                    }
+                    this.prevPosition.copy(el.object3D.position);
+                    return;
+                }
+
+                if (this.wallObjects.length === 0) return;
+
+                const currentPosition = el.object3D.position;
+                const origin = new THREE.Vector3(currentPosition.x, 1.6, currentPosition.z);
+                let isColliding = false;
+
+                for (let dir of this.directions) {
+                    this.raycaster.set(origin, dir);
+                    const intersects = this.raycaster.intersectObjects(this.wallObjects, true);
+                    if (intersects.length > 0 && intersects[0].distance < this.radius) {
+                        isColliding = true;
+                        break;
+                    }
+                }
+
+                if (isColliding) {
+                    el.object3D.position.copy(this.prevPosition);
+                } else {
+                    this.prevPosition.copy(currentPosition);
+                }
+            }
+        });
+
+        // --- ゴール検知コンポーネント（3回取得でクリア＆初期位置リセット） ---
+        AFRAME.registerComponent('goal-detector', {
+            init: function () {
+                this.coinCount = 0;
+                this.isFinished = false;
+            },
+            tick: function () {
+                if (this.isFinished) return;
+
+                const pos = this.el.object3D.position;
+                const goals = document.querySelectorAll('.goal-candidate');
+
+                goals.forEach(g => {
+                    const gPos = g.object3D.position;
+                    const dist = pos.distanceTo(gPos);
+
+                    if (dist < 1.2) {
+                        this.coinCount++;
+                        const coinName = g.dataset.name;
+                        g.parentNode.removeChild(g); // 取得したコインを消去
+
+                        // 初期地点へテレポート
+                        this.el.setAttribute('position', spawnPosition);
+                        
+                        // コライダーの履歴をリセットして引き戻しを防ぐ
+                        const collider = this.el.components['simple-collider'];
+                        if (collider) collider.resetPrevPosition();
+
+                        // 3回目かどうかでメッセージを分岐
+                        if (this.coinCount < 3) {
+                            alert('はずれ！まだ迷路は続いているよ！');
+                            if (typeof socket !== 'undefined' && socket.connected) {
+                                socket.emit('チェックポイント通過', {
+                                    checkpoint_name: coinName,
+                                    time: new Date().toISOString()
+                                });
+                            }
+                        } else {
+                            this.isFinished = true;
+                            alert('ゴールおめでとう！');
+                            if (typeof socket !== 'undefined' && socket.connected) {
+                                socket.emit('ゴール到達', {
+                                    goal_name: coinName,
+                                    time: new Date().toISOString()
+                                });
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    </script>
+
+    <a-scene>
+        <a-assets>
+            <audio id="ambient-sound" src="https://cdn.aframe.io/basic-guide/audio/backgroundnoise.mp3" crossorigin="anonymous"></audio>
+        </a-assets>
+
+        <a-plane position="0 0 0" rotation="-90 0 0" width="150" height="150" color="#8AD1A9"></a-plane>
+        <a-sky color="#87CEEB"></a-sky>
+
+        <a-entity light="type: ambient; color: #FFFFFF; intensity: 0.8"></a-entity>
+        <a-entity light="type: directional; color: #FFF; intensity: 0.6" position="-1 2 1"></a-entity>
+
+        <a-entity id="maze-container"></a-entity>
+
+        <!-- simple-collider と goal-detector をアタッチ -->
+        <a-camera id="camera" position="0 1.6 0" wasd-controls="acceleration: 20" look-controls simple-collider goal-detector>
+            <a-cursor fuse="false" color="#00BCD4" raycaster="objects: .lookable; far: 30"></a-cursor>
+        </a-camera>
+    </a-scene>
+
+    <script>
+        const socket = io();
+        const scene = document.querySelector('a-scene');
+        const camera = document.querySelector('#camera');
+        const mazeContainer = document.querySelector('#maze-container');
+
+        const maze = [
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            [1, 3, 6, 6, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 3, 0, 0, 0, 0, 1],
+            [1, 1, 1, 6, 1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1],
+            [1, 0, 0, 6, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1],
+            [1, 0, 1, 6, 1, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1],
+            [1, 0, 0, 6, 6, 6, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1],
+            [1, 1, 1, 1, 1, 6, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1],
+            [1, 0, 0, 0, 1, 6, 6, 6, 6, 6, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1],
+            [1, 0, 1, 0, 1, 0, 1, 1, 1, 6, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1],
+            [1, 0, 1, 0, 0, 0, 1, 0, 1, 6, 6, 6, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1],
+            [1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 6, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1],
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1],
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 6, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 6, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1],
+            [1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 6, 1, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1],
+            [1, 3, 1, 0, 0, 0, 1, 0, 0, 0, 0, 6, 6, 2, 2, 2, 0, 5, 5, 5, 5, 5, 1, 0, 0, 0, 1, 0, 0, 3, 1],
+            [1, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 5, 1, 1, 1, 0, 1, 0, 1, 5, 1],
+            [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 2, 2, 2, 1, 0, 0, 0, 1, 5, 0, 0, 1, 0, 1, 0, 0, 5, 1],
+            [1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 7, 1, 1, 0, 1, 0, 1, 5, 1, 0, 1, 1, 1, 1, 1, 5, 1],
+            [1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 7, 8, 1, 1, 0, 1, 0, 0, 5, 1, 0, 0, 0, 0, 0, 1, 5, 1],
+            [1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 7, 8, 8, 1, 0, 1, 0, 1, 1, 1, 5, 1, 1, 1, 1, 1, 0, 1, 5, 1],
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 7, 1, 0, 0, 0, 1, 0, 0, 0, 0, 5, 5, 5, 5, 5, 1, 0, 0, 5, 1],
+            [1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 7, 1, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 5, 1, 1, 1, 5, 1],
+            [1, 0, 1, 0, 0, 0, 7, 8, 8, 8, 8, 8, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 5, 0, 0, 1, 5, 1],
+            [1, 0, 1, 0, 1, 1, 7, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 5, 1, 0, 1, 5, 1],
+            [1, 0, 0, 0, 1, 0, 7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 5, 1, 0, 0, 5, 1],
+            [1, 1, 1, 0, 1, 7, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 5, 1, 1, 1, 5, 1],
+            [1, 0, 0, 0, 1, 7, 1, 9, 9, 7, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 5, 1, 5, 5, 5, 1],
+            [1, 0, 1, 0, 1, 7, 1, 4, 1, 7, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 5, 1, 5, 1, 0, 1],
+            [1, 0, 1, 0, 0, 9, 9, 4, 1, 9, 9, 9, 9, 9, 9, 3, 1, 0, 0, 0, 0, 0, 1, 0, 0, 5, 5, 5, 1, 0, 1],
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        ];
+
+        const WALL_SIZE = 2;
+        const WALL_HEIGHT = 2.5;
+        
+        const goalColors = ['#FFD700', '#9C27B0', '#00BCD4', '#FF9800'];
+        let createdGoalCount = 0;
+
+        function createCoinObject(x, z, r, c, typeName, colorHex) {
+            const coin = document.createElement('a-cylinder');
+            coin.setAttribute('class', 'goal-candidate lookable');
+            coin.setAttribute('data-name', `COIN_${typeName}_${r}_${c}`);
+            coin.setAttribute('position', { x: x, y: 1, z: z });
+            coin.setAttribute('radius', 0.4);
+            coin.setAttribute('height', 0.1);
+            coin.setAttribute('color', colorHex);
+            coin.setAttribute('rotation', '0 0 90');
+            coin.setAttribute('animation', 'property: rotation; to: 0 360 90; loop: true; dur: 3000; easing: linear');
+            return coin;
+        }
+
+        function createMaze() {
+            const rows = maze.length;
+            const cols = maze[0].length;
+            const offsetX = (cols * WALL_SIZE) / 2;
+            const offsetZ = (rows * WALL_SIZE) / 2;
+            let spawnPointFound = false;
+
+            for (let r = 0; r < rows; r++) {
+                for (let c = 0; c < cols; c++) {
+                    const val = maze[r][c];
+                    const x = c * WALL_SIZE - offsetX;
+                    const z = r * WALL_SIZE - offsetZ;
+
+                    if (val === 1) {
+                        const wall = document.createElement('a-box');
+                        wall.setAttribute('class', 'wall lookable');
+                        wall.setAttribute('position', { x: x, y: WALL_HEIGHT / 2, z: z });
+                        wall.setAttribute('width', WALL_SIZE);
+                        wall.setAttribute('height', WALL_HEIGHT);
+                        wall.setAttribute('depth', WALL_SIZE);
+                        wall.setAttribute('color', '#4A6572');
+                        mazeContainer.appendChild(wall);
+                    }
+                    else if (val === 2 && !spawnPointFound) {
+                        // スタート地点の座標を記録してカメラを配置
+                        spawnPosition = { x: x + WALL_SIZE, y: 1.6, z: z + WALL_SIZE };
+                        camera.setAttribute('position', spawnPosition);
+                        spawnPointFound = true;
+                    }
+                    else if (val === 3) { 
+                        const color = goalColors[createdGoalCount % 4];
+                        mazeContainer.appendChild(createCoinObject(x, z, r, c, `ゴール${createdGoalCount + 1}`, color)); 
+                        createdGoalCount++;
+                    }
+                    else if ([4, 7, 8, 9].includes(val)) {
+                        let arrowText = '';
+                        if (val === 4) arrowText = '^';
+                        else if (val === 7) arrowText = 'v';
+                        else if (val === 8) arrowText = '<--';
+                        else if (val === 9) arrowText = '-->';
+
+                        const board = document.createElement('a-plane');
+                        board.setAttribute('class', 'lookable');
+                        board.setAttribute('position', { x: x, y: 0.01, z: z });
+                        board.setAttribute('rotation', '-90 0 0');
+                        board.setAttribute('width', WALL_SIZE);
+                        board.setAttribute('height', WALL_SIZE);
+                        board.setAttribute('color', '#FF5722');
+                        board.setAttribute('text', `value: ${arrowText}; align: center; width: 8; color: #FFFFFF`);
+                        mazeContainer.appendChild(board);
+                    }
+                    else if (val === 5) {
+                        const textObj = document.createElement('a-plane');
+                        textObj.setAttribute('class', 'lookable');
+                        textObj.setAttribute('position', { x: x, y: 0.01, z: z });
+                        textObj.setAttribute('rotation', '-90 0 0');
+                        textObj.setAttribute('width', WALL_SIZE);
+                        textObj.setAttribute('height', WALL_SIZE);
+                        textObj.setAttribute('color', '#27AE60');
+                        textObj.setAttribute('text', 'value: HERE; align: center; width: 8; color: #FFFFFF');
+                        mazeContainer.appendChild(textObj);
+                    }
+                    else if (val === 6) {
+                        const lightPlane = document.createElement('a-plane');
+                        lightPlane.setAttribute('position', { x: x, y: 0.01, z: z });
+                        lightPlane.setAttribute('rotation', '-90 0 0');
+                        lightPlane.setAttribute('width', WALL_SIZE);
+                        lightPlane.setAttribute('height', WALL_SIZE);
+                        lightPlane.setAttribute('color', '#FFEB3B');
+                        mazeContainer.appendChild(lightPlane);
+
+                        const lightObj = document.createElement('a-entity');
+                        lightObj.setAttribute('position', { x: x, y: 1.0, z: z });
+                        lightObj.setAttribute('light', 'type: point; intensity: 1.0; distance: 5; color: #FFF8E1');
+                        mazeContainer.appendChild(lightObj);
+                    }
+                }
+            }
+
+            const collider = camera.components['simple-collider'];
+            if (collider) {
+                collider.updateWalls();
+                collider.resetPrevPosition();
+            }
+        }
+
+        if (scene.hasLoaded) {
+            createMaze();
+        } else {
+            scene.addEventListener('loaded', createMaze);
+        }
+
+        setInterval(() => {
+            if (!socket.connected) return;
+            const position = camera.getAttribute('position');
+            const rotation = camera.getAttribute('rotation');
+            socket.emit('自分が移動した', { position: position, rotation: rotation });
+        }, 100);
+
+        function createPlayer(player) {
+            if (player.id === socket.id) return;
+            if (document.getElementById('player-' + player.id)) return;
+
+            const playerEntity = document.createElement('a-entity');
+            playerEntity.setAttribute('id', 'player-' + player.id);
+            playerEntity.setAttribute('position', player.position);
+            playerEntity.setAttribute('rotation', { x: 0, y: player.rotation.y, z: 0 });
+
+            const head = document.createElement('a-sphere');
+            head.setAttribute('position', { x: 0, y: 0, z: 0 });
+            head.setAttribute('radius', 0.25);
+            head.setAttribute('color', player.color);
+
+            const body = document.createElement('a-cylinder');
+            body.setAttribute('position', { x: 0, y: -0.8, z: 0 });
+            body.setAttribute('radius', 0.3);
+            body.setAttribute('height', 1.2);
+            body.setAttribute('color', player.color);
+
+            playerEntity.appendChild(head);
+            playerEntity.appendChild(body);
+            scene.appendChild(playerEntity);
+        }
+
+        function updatePlayer(player) {
+            if (player.id === socket.id) return;
+            const playerEntity = document.getElementById('player-' + player.id);
+            if (!playerEntity) {
+                createPlayer(player);
+                return;
+            }
+            playerEntity.setAttribute('position', player.position);
+            playerEntity.setAttribute('rotation', { x: 0, y: player.rotation.y, z: 0 });
+        }
+
+        socket.on('プレイヤー一覧', (players) => players.forEach(createPlayer));
+        socket.on('他者が入室した', createPlayer);
+        socket.on('他者が移動した', updatePlayer);
+        socket.on('他者がいなくなった', (playerId) => {
+            const playerEntity = document.getElementById('player-' + playerId);
+            if (playerEntity) playerEntity.remove();
+        });
+
+        const cursor = document.querySelector('a-cursor');
+        let gazeTarget = null;
+        let gazeStart = null;
+        const MIN_GAZE_MS = 300;
+
+        cursor.addEventListener('mouseenter', (event) => {
+            const target = event.detail.intersectedEl;
+            if (!target) return;
+            gazeTarget = target;
+            gazeStart = new Date();
+        });
+
+        cursor.addEventListener('mouseleave', () => {
+            if (!gazeTarget) return;
+            const gazeEnd = new Date();
+            const duration = gazeEnd - gazeStart;
+
+            if (duration >= MIN_GAZE_MS && gazeTarget.dataset.name) {
+                socket.emit('見た', {
+                    object_name: gazeTarget.dataset.name,
+                    start_time: gazeStart.toISOString(),
+                    end_time: gazeEnd.toISOString(),
+                    duration_ms: duration
+                });
+            }
+            gazeTarget = null;
+            gazeStart = null;
+        });
+    </script>
+</body>
+</html>
