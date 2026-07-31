@@ -1,0 +1,12 @@
+# 不要なライブラリや環境フォルダ
+node_modules/
+.venv/
+__pycache__/
+
+# 生成されたログデータや画像フォルダ
+player_logs.db
+movement_output/
+output/
+
+# OSの自動生成ファイル
+.DS_Store
