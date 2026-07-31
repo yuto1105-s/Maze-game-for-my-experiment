@@ -196,3 +196,22 @@ const PORT = 3000;
 server.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}`);
 });
+// --- データベースダウンロード用エンドポイント ---
+app.get('/download-db', (req, res) => {
+  // 簡易セキュリティ（?key=secret123 のようにURLで合言葉を指定する）
+  const secretKey = 'secret123'; // ← 好きなパスワードに変更してください
+
+  if (req.query.key !== secretKey) {
+    return res.status(403).send('アクセス権限がありません (Invalid Key)');
+  }
+
+  const dbPath = __dirname + '/player_logs.db';
+
+  // ファイルが存在するか確認してダウンロードレスポンスを返す
+  res.download(dbPath, 'player_logs.db', (err) => {
+    if (err) {
+      console.error('Download error:', err);
+      res.status(404).send('データベースファイルが存在しません。');
+    }
+  });
+});
