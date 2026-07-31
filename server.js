@@ -199,7 +199,7 @@ server.listen(PORT, () => {
 // --- データベースダウンロード用エンドポイント ---
 app.get('/download-db', (req, res) => {
   // 簡易セキュリティ（?key=secret123 のようにURLで合言葉を指定する）
-  const secretKey = 'secret123'; // ← 好きなパスワードに変更してください
+  const secretKey = 'yuto1105'; // ← 好きなパスワードに変更してください
 
   if (req.query.key !== secretKey) {
     return res.status(403).send('アクセス権限がありません (Invalid Key)');
